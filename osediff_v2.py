@@ -158,7 +158,7 @@ class OSEDiff_reg(torch.nn.Module):
 
         weight_dtype = torch.float32
         if accelerator.mixed_precision == "fp16":
-            weight_dtype = torch.float16
+            weight_dtype = torch.bfloat16
         elif accelerator.mixed_precision == "bf16":
             weight_dtype = torch.bfloat16
         self.weight_dtype = weight_dtype
@@ -272,6 +272,12 @@ class OSEDiff_test(torch.nn.Module):
         self.weight_dtype = torch.float32
         if args.mixed_precision == "fp16":
             self.weight_dtype = torch.bfloat16
+
+        # Forcefully cast all layers to the correct dtype
+        for module in self.vae.modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                module.to(dtype=self.weight_dtype)
+        self.vae.to(dtype=self.weight_dtype)
 
         osediff = torch.load(args.osediff_path, map_location = torch.device('cpu')) # Model loaded from CPU, then moved to TPU in load_ckpt
         
@@ -498,6 +504,12 @@ class OSEDiff_inference_time(torch.nn.Module):
         if args.mixed_precision == "fp16":
             self.weight_dtype = torch.bfloat16
 
+        # Forcefully cast all layers to the correct dtype
+        for module in self.vae.modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                module.to(dtype=self.weight_dtype)
+        self.vae.to(dtype=self.weight_dtype)
+
         osediff = torch.load(args.osediff_path, map_location = torch.device('cpu'))  # Model loaded from CPU, then moved to TPU in load_ckpt
         self.load_ckpt(osediff)
 
@@ -562,6 +574,8 @@ class OSEDiff_inference_time(torch.nn.Module):
 
         prompt_embeds = self.encode_prompt([prompt]) # prompt embeds already on device
 
+        # lq_latent = self.vae.encode(lq).latent_dist.sample() * self.vae.config.scaling_factor
+        # for test_inference_time call
         lq_latent = self.vae.encode(lq).latent_dist.sample() * self.vae.config.scaling_factor
         model_pred = self.unet(lq_latent, self.timesteps, encoder_hidden_states=prompt_embeds).sample
         x_denoised = self.noise_scheduler.step(model_pred, self.timesteps, lq_latent, return_dict=True).prev_sample

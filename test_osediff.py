@@ -9,6 +9,9 @@ import torchvision.transforms.functional as F
 import numpy as np
 from PIL import Image
 
+import torch_xla.runtime as xr
+import torch_xla.distributed.xla_multiprocessing as xmp
+
 from osediff import OSEDiff_test
 from my_utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
 
@@ -25,7 +28,7 @@ ram_transforms = transforms.Compose([
         ])
 
 
-def get_validation_prompt(args, image, model, device='cuda'):
+def get_validation_prompt(args, image, model, device='xla:0'):
     validation_prompt = ""
     lq = tensor_transforms(image).unsqueeze(0).to(device)
     lq_ram = ram_transforms(lq).to(dtype=weight_dtype)
@@ -80,7 +83,8 @@ if __name__ == "__main__":
     # weight type
     weight_dtype = torch.float32
     if args.mixed_precision == "fp16":
-        weight_dtype = torch.float16
+        # weight_dtype = torch.float16
+        weight_dtype = torch.bfloat16
 
     # set weight type
     DAPE = DAPE.to(dtype=weight_dtype)

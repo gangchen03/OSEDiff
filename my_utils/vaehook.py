@@ -547,9 +547,12 @@ class VAEHook:
     def __call__(self, x):
         B, C, H, W = x.shape
         original_device = next(self.net.parameters()).device
+        print(f"VAE device uses: {original_device}" )
         try:
             if self.to_gpu:
-                self.net.to(devices.get_optimal_device())
+                print(f"VAE device uses to_gpu")
+                # self.net.to(devices.get_optimal_device())
+                self.net.to(original_device)
             if max(H, W) <= self.pad * 2 + self.tile_size:
                 print("[Tiled VAE]: the input size is tiny and unnecessary to tile.")
                 return self.net.original_forward(x)
