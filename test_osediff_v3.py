@@ -1,3 +1,7 @@
+# This version fixes the latent size for XLA compilation cache
+# It also has a warm-up phase with a dummy lq to trigger the pre-compile
+# Future work: need to adjust the shape size to dynamically cache the input
+
 import os
 import sys
 sys.path.append(os.getcwd())
@@ -11,6 +15,8 @@ from PIL import Image
 import time
 from osediff import OSEDiff_test
 from my_utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
+import traceback # Import traceback for better error logging
+
 
 import gc # Import garbage collector
 from ram.models.ram_lora import ram
@@ -36,13 +42,29 @@ def get_validation_prompt(args, image, model, device='xla:0'):
     validation_prompt = ""
     lq = tensor_transforms(image).unsqueeze(0).to(device)
     # weight type
-    weight_dtype = torch.bfloat16
+    weight_dtype = torch.bfloat16 # Assuming bfloat16 for TPU
     lq = lq.to(dtype = weight_dtype)
-    #lq_ram = ram_transforms(lq).to(dtype=weight_dtype)
-    #captions = inference(lq_ram, model)
-    #validation_prompt = f"{captions[0]}, {args.prompt},"
+    # --- RAM Model Captioning (Optional, currently commented out) ---
+    # if model is not None: # Check if DAPE model was loaded
+    #     try:
+    #         # Ensure lq is in the range [0, 1] for RAM transforms if needed
+    #         lq_for_ram = lq.clamp(0, 1) # Clamp if lq might be [-1, 1] here
+    #         lq_ram = ram_transforms(lq_for_ram).to(dtype=model.dtype, device=device) # Match DAPE's dtype
+    #         with torch.no_grad():
+    #              captions = inference(lq_ram, model)
+    #         if captions:
+    #              validation_prompt = f"{captions[0]}, {args.prompt}" # Combine caption and base prompt
+    #         else:
+    #              validation_prompt = args.prompt # Fallback to base prompt
+    #     except Exception as e:
+    #         print(f"  Warning: Error during caption generation: {e}")
+    #         validation_prompt = args.prompt # Fallback on error
+    # else:
+    #     validation_prompt = args.prompt # Use base prompt if DAPE is None
+    # -----------------------------------------------------------------
+    # For now, just use an empty prompt as per the original logic
     validation_prompt = ""
-    
+
     return validation_prompt, lq
 
 def inference_in_parallel(index, all_image_names):
@@ -81,6 +103,38 @@ def inference_in_parallel(index, all_image_names):
     if args.save_prompts:
         txt_path = os.path.join(args.output_dir, 'txt')
         os.makedirs(txt_path, exist_ok=True)
+
+    # --- XLA Warm-up Step ---
+    print(f"Rank {rank}: Starting XLA warm-up...")
+    warmup_start_time = time.time()
+    try:
+        # Create a dummy tensor with the static shape and model's dtype
+        # Use the model's expected input dtype (often self.weight_dtype in OSEDiff_test)
+        # The input range should be [-1, 1] for the model
+        dummy_input = torch.randn(1, 3, target_h, target_w, # B, C, H, W
+                                  dtype=model.weight_dtype,
+                                  device=device)
+        dummy_prompt = "warmup"
+
+        with torch.no_grad():
+            _ = model(dummy_input, prompt=dummy_prompt) # Run one forward pass
+            # Optionally, run color fix warmup if used
+            if args.align_method != 'nofix':
+                 dummy_source = torch.randn_like(dummy_input)
+                 if args.align_method == 'adain' and 'adain_color_fix_tensor' in globals():
+                      _ = adain_color_fix_tensor(dummy_input, dummy_source)
+                 elif args.align_method == 'wavelet' and 'wavelet_color_fix_tensor' in globals():
+                      _ = wavelet_color_fix_tensor(dummy_input, dummy_source)
+
+        xm.mark_step() # Ensure compilation finishes
+        warmup_end_time = time.time()
+        print(f"Rank {rank}: XLA warm-up finished in {warmup_end_time - warmup_start_time:.4f}s")
+    except Exception as e:
+        print(f"Rank {rank}: Error during XLA warm-up: {e}")
+        # Decide if you want to continue or exit if warmup fails
+        # sys.exit(1) # Example: exit if warmup fails
+    # -------------------------
+
 
     # splitted image_names
     num_images_per_process = len(all_image_names) // world_size + (1 if len(all_image_names) % world_size > rank else 0)
@@ -253,7 +307,7 @@ def inference_in_parallel(index, all_image_names):
             print(f"  Saved to: {save_path}")
 
         # Total time for this image (model + post-processing)
-        total_image_time = time.time() - time0
+        total_image_time = time.time() - time0 # time0 starts just before the real inference call
         print(f"  Total time for image {bname}: {total_image_time:.4f}s")
         # Optional: Force garbage collection between images if memory is tight
         # gc.collect()
@@ -274,17 +328,22 @@ if __name__ == "__main__":
     parser.add_argument('--ram_ft_path', type=str, default=None)
     parser.add_argument('--save_prompts', type=bool, default=True)
     # precision setting
-    parser.add_argument("--mixed_precision", type=str, choices=['fp16', 'fp32'], default="fp16")
+    parser.add_argument("--mixed_precision", type=str, choices=['fp16', 'fp32'], default="fp16") # Note: 'fp16' likely means bfloat16 on TPU
     # merge lora
     parser.add_argument("--merge_and_unload_lora", default=False) # merge lora weights before inference
     # tile setting
-    parser.add_argument("--vae_decoder_tiled_size", type=int, default=224) 
-    parser.add_argument("--vae_encoder_tiled_size", type=int, default=1024) 
-    parser.add_argument("--latent_tiled_size", type=int, default=96) 
-    parser.add_argument("--latent_tiled_overlap", type=int, default=32) 
+    parser.add_argument("--vae_decoder_tiled_size", type=int, default=224)
+    parser.add_argument("--vae_encoder_tiled_size", type=int, default=1024)
+    parser.add_argument("--latent_tiled_size", type=int, default=96)
+    parser.add_argument("--latent_tiled_overlap", type=int, default=32)
     parser.add_argument("--num_devices", type=int, default=4)
 
     args = parser.parse_args()
+
+    # Validate mixed_precision for TPU
+    if args.mixed_precision == "fp16":
+        print("Warning: Using 'fp16' for mixed_precision on TPU. This typically maps to bfloat16.")
+        # PyTorch/XLA generally uses bfloat16 when fp16 is requested.
 
     num_devices=args.num_devices
     print(f"Devices: {num_devices}")
@@ -300,4 +359,3 @@ if __name__ == "__main__":
     print(f'There are {len(image_names)} images.')
 
     xmp.spawn(inference_in_parallel, args=(image_names,), nprocs=num_devices, start_method='fork')
-
